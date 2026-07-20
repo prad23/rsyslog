@@ -470,6 +470,38 @@ This option is only used if `cacheexpireinterval` is 0 or greater.
 This value must be 0 or greater, otherwise, if `cacheexpireinterval` is 0
 or greater, you will get an error.
 
+.. _mmkubernetes-tokenreloadinterval:
+
+tokenreloadinterval
+^^^^^^^^^^^^^^^^^^^
+
+.. csv-table::
+   :header: "type", "default", "mandatory", "|FmtObsoleteName| directive"
+   :widths: auto
+   :class: parameter-table
+
+   "integer", "3600", "no", "none"
+
+How often, in seconds, to proactively re-read the bearer token from
+`tokenfile` (see :ref:`mmkubernetes-tokenfile`).  The default is `3600`
+(one hour).
+
+The token read from `tokenfile` is cached in the HTTP ``Authorization``
+header when the worker starts.  Kubernetes projected ServiceAccount tokens
+are short-lived and rotated on disk by the kubelet (well before they
+expire), so a long-running worker would otherwise keep sending the original
+token until it becomes invalid, at which point metadata lookups fail with
+HTTP 401 until the process is restarted.  Re-reading the token periodically
+keeps the worker well inside the token validity window.
+
+Set this to `0` to disable the proactive reload.  Regardless of this
+setting, `mmkubernetes` also reloads the token from `tokenfile` and retries
+the request once when a lookup returns HTTP 401, so a rotated token is
+picked up automatically without a restart.  This value must be 0 or greater.
+
+This option has no effect when the inline `token` parameter is used instead
+of `tokenfile`.
+
 .. _mmkubernetes-statistic-counter:
 
 Statistic Counter

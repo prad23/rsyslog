@@ -41,6 +41,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <libestr.h>
 #include <liblognorm.h>
@@ -107,6 +108,9 @@ DEFobjCurrIf(datetime)
 #define DFLT_CACHE_EXPIRE_INTERVAL -1 /* delete all expired entries from the cache every N seconds
 					 -1 disables cache expiration/ttl checking
 					 0 means - run cache expiration for every record */
+#define DFLT_TOKEN_RELOAD_INTERVAL 3600 /* proactively re-read the bearer token from tokenfile every N
+					 seconds so a rotated projected ServiceAccount token is picked
+					 up without a restart; 0 disables the proactive reload */
 
 /* only support setting the partial chain flag on openssl platforms that have the define */
 #if defined(ENABLE_OPENSSL) && defined(X509_V_FLAG_PARTIAL_CHAIN)
@@ -158,6 +162,8 @@ struct modConfData_s {
 	sbool sslPartialChain; /* if true, allow using intermediate certs without root certs */
 	int cacheEntryTTL; /* delete entries from the cache if they are older than this many seconds */
 	int cacheExpireInterval; /* delete all expired entries from the cache every this many seconds */
+	int tokenReloadInterval; /* proactively re-read the token from tokenFile every this many seconds
+				    (0 disables); guards against short-lived rotated SA tokens going stale */
 };
 
 /* action (instance) configuration data */
@@ -189,12 +195,15 @@ typedef struct _instanceData {
 	sbool sslPartialChain; /* if true, allow using intermediate certs without root certs */
 	int cacheEntryTTL; /* delete entries from the cache if they are older than this many seconds */
 	int cacheExpireInterval; /* delete all expired entries from the cache every this many seconds */
+	int tokenReloadInterval; /* proactively re-read the token from tokenFile every this many seconds
+				    (0 disables); guards against short-lived rotated SA tokens going stale */
 } instanceData;
 
 typedef struct wrkrInstanceData {
 	instanceData *pData;
 	CURL *curlCtx;
 	struct curl_slist *curlHdr;
+	time_t lastTokenReload; /* when curlHdr's bearer token was last (re)read from disk */
 	char *curlRply;
 	size_t curlRplyLen;
 	statsobj_t *stats; /* stats for this instance */
@@ -236,7 +245,8 @@ static struct cnfparamdescr modpdescr[] = {
 	{ "busyretryinterval", eCmdHdlrInt, 0 },
 	{ "sslpartialchain", eCmdHdlrBinary, 0 },
 	{ "cacheentryttl", eCmdHdlrInt, 0 },
-	{ "cacheexpireinterval", eCmdHdlrInt, 0 }
+	{ "cacheexpireinterval", eCmdHdlrInt, 0 },
+	{ "tokenreloadinterval", eCmdHdlrInt, 0 }
 #if HAVE_LOADSAMPLESFROMSTRING == 1
 	,
 	{ "filenamerules", eCmdHdlrArray, 0 },
@@ -269,7 +279,8 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "busyretryinterval", eCmdHdlrInt, 0 },
 	{ "sslpartialchain", eCmdHdlrBinary, 0 },
 	{ "cacheentryttl", eCmdHdlrInt, 0 },
-	{ "cacheexpireinterval", eCmdHdlrInt, 0 }
+	{ "cacheexpireinterval", eCmdHdlrInt, 0 },
+	{ "tokenreloadinterval", eCmdHdlrInt, 0 }
 #if HAVE_LOADSAMPLESFROMSTRING == 1
 	,
 	{ "filenamerules", eCmdHdlrArray, 0 },
@@ -583,6 +594,7 @@ CODESTARTsetModCnf
 	loadModConf->sslPartialChain = DFLT_SSL_PARTIAL_CHAIN;
 	loadModConf->cacheEntryTTL = DFLT_CACHE_ENTRY_TTL;
 	loadModConf->cacheExpireInterval = DFLT_CACHE_EXPIRE_INTERVAL;
+	loadModConf->tokenReloadInterval = DFLT_TOKEN_RELOAD_INTERVAL;
 	for(i = 0 ; i < modpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed) {
 			continue;
@@ -723,6 +735,8 @@ CODESTARTsetModCnf
 			loadModConf->cacheEntryTTL = pvals[i].val.d.n;
 		} else if(!strcmp(modpblk.descr[i].name, "cacheexpireinterval")) {
 			loadModConf->cacheExpireInterval = pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, "tokenreloadinterval")) {
+			loadModConf->tokenReloadInterval = pvals[i].val.d.n;
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in module() block\n", modpblk.descr[i].name);
@@ -751,6 +765,14 @@ CODESTARTsetModCnf
 					loadModConf->cacheEntryTTL);
 			ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 		}
+	}
+
+	if (loadModConf->tokenReloadInterval < 0) {
+		LogError(0, RS_RET_CONFIG_ERROR,
+				"mmkubernetes: tokenreloadinterval value [%d] is invalid - "
+				"value must be 0 (disabled) or greater",
+				loadModConf->tokenReloadInterval);
+		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 	}
 
 	/* set defaults */
@@ -851,13 +873,97 @@ finalize_it:
 }
 #endif
 
+/**
+ * (Re)build the curl Authorization header for a worker from the current bearer
+ * token and bind it to the worker's curl handle.
+ *
+ * The token is read fresh on every call: @c pData->token (inline, takes
+ * precedence) or the contents of @c pData->tokenFile. This lets a rotated or
+ * late-authorized projected ServiceAccount token be picked up without
+ * recreating the worker. Any header list previously installed on the handle is
+ * released. @c lastTokenReload is stamped so the proactive reload in queryKB()
+ * can schedule the next refresh.
+ *
+ * Shared by createWrkrInstance() (initial build) and the reload paths in
+ * queryKB() (proactive interval + reactive on 401), so the token is read
+ * through a single code path.
+ *
+ * @param[in] pWrkrData worker instance whose curlHdr is (re)built and bound to
+ *            its already-initialized curlCtx
+ * @returns RS_RET_OK on success, or an error code (the previously installed
+ *          header is left in place on failure)
+ */
+static rsRetVal
+mmk_build_token_header(wrkrInstanceData_t *pWrkrData)
+{
+	DEFiRet;
+	struct curl_slist *hdr = NULL;
+	char *tokenHdr = NULL;
+	char *token = NULL;
+	FILE *fp = NULL;
+
+	hdr = curl_slist_append(hdr, "Content-Type: text/json; charset=utf-8");
+	if (pWrkrData->pData->token) {
+		/* asprintf leaves the pointer undefined on failure, so NULL it before
+		 * aborting - finalize_it frees tokenHdr unconditionally */
+		if (asprintf(&tokenHdr, "Authorization: Bearer %s", pWrkrData->pData->token) == -1) {
+			tokenHdr = NULL;
+			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+		}
+	} else if (pWrkrData->pData->tokenFile) {
+		struct stat statbuf;
+		fp = fopen((const char*)pWrkrData->pData->tokenFile, "r");
+		if (fp && !fstat(fileno(fp), &statbuf)) {
+			size_t bytesread;
+			CHKmalloc(token = malloc((statbuf.st_size+1)*sizeof(char)));
+			if (0 < (bytesread = fread(token, sizeof(char), statbuf.st_size, fp))) {
+				token[bytesread] = '\0';
+				if (asprintf(&tokenHdr, "Authorization: Bearer %s", token) == -1) {
+					tokenHdr = NULL;
+					ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+				}
+			}
+		}
+	}
+	/* If a token source is configured but we could not read a token (e.g. the
+	 * projected token volume is transiently unavailable during rotation), do not
+	 * tear down a header that is already installed: keep the existing,
+	 * still-likely-valid Authorization header and leave lastTokenReload
+	 * unchanged so the caller retries the reload on the next lookup. On the
+	 * initial build (curlHdr == NULL) there is nothing to preserve, so we fall
+	 * through and install the token-less header, matching the original startup
+	 * behavior. */
+	if (tokenHdr == NULL && (pWrkrData->pData->token || pWrkrData->pData->tokenFile) &&
+	    pWrkrData->curlHdr != NULL) {
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+	if (tokenHdr) {
+		hdr = curl_slist_append(hdr, tokenHdr);
+	}
+	/* swap in the fresh header, releasing any previously installed one */
+	if (pWrkrData->curlHdr != NULL) {
+		curl_slist_free_all(pWrkrData->curlHdr);
+	}
+	pWrkrData->curlHdr = hdr;
+	curl_easy_setopt(pWrkrData->curlCtx, CURLOPT_HTTPHEADER, hdr);
+	hdr = NULL;
+	pWrkrData->lastTokenReload = time(NULL);
+finalize_it:
+	free(token);
+	free(tokenHdr);
+	if (fp != NULL) {
+		fclose(fp);
+	}
+	if (hdr != NULL) {
+		curl_slist_free_all(hdr);
+	}
+	RETiRet;
+}
+
+
 BEGINcreateWrkrInstance
 CODESTARTcreateWrkrInstance
 	CURL *ctx;
-	struct curl_slist *hdr = NULL;
-	char *tokenHdr = NULL;
-	FILE *fp = NULL;
-	char *token = NULL;
 	char *statsName = NULL;
 
 	CHKiRet(statsobj.Construct(&(pWrkrData->stats)));
@@ -916,40 +1022,8 @@ CODESTARTcreateWrkrInstance
 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &(pWrkrData->podCacheMisses)));
 	CHKiRet(statsobj.ConstructFinalize(pWrkrData->stats));
 
-	hdr = curl_slist_append(hdr, "Content-Type: text/json; charset=utf-8");
-	if (pWrkrData->pData->token) {
-		if ((-1 == asprintf(&tokenHdr, "Authorization: Bearer %s", pWrkrData->pData->token)) ||
-			(!tokenHdr)) {
-			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-		}
-	} else if (pWrkrData->pData->tokenFile) {
-		struct stat statbuf;
-		fp = fopen((const char*)pWrkrData->pData->tokenFile, "r");
-		if (fp && !fstat(fileno(fp), &statbuf)) {
-			size_t bytesread;
-			CHKmalloc(token = malloc((statbuf.st_size+1)*sizeof(char)));
-			if (0 < (bytesread = fread(token, sizeof(char), statbuf.st_size, fp))) {
-				token[bytesread] = '\0';
-				if ((-1 == asprintf(&tokenHdr, "Authorization: Bearer %s", token)) ||
-					(!tokenHdr)) {
-					ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-				}
-			}
-			free(token);
-			token = NULL;
-		}
-		if (fp) {
-			fclose(fp);
-			fp = NULL;
-		}
-	}
-	if (tokenHdr) {
-		hdr = curl_slist_append(hdr, tokenHdr);
-		free(tokenHdr);
-	}
-	pWrkrData->curlHdr = hdr;
 	ctx = curl_easy_init();
-	curl_easy_setopt(ctx, CURLOPT_HTTPHEADER, hdr);
+	pWrkrData->curlCtx = ctx;
 	curl_easy_setopt(ctx, CURLOPT_WRITEFUNCTION, curlCB);
 	curl_easy_setopt(ctx, CURLOPT_WRITEDATA, pWrkrData);
 	if(pWrkrData->pData->caCertFile)
@@ -968,15 +1042,27 @@ CODESTARTcreateWrkrInstance
 		curl_easy_setopt(ctx, CURLOPT_SSL_CTX_DATA, NULL);
 	}
 #endif
-	pWrkrData->curlCtx = ctx;
+	/* build the Authorization header from the current token on disk and bind it
+	 * to the handle just initialized; shared with the reload paths in queryKB()
+	 * so the token is read through one code path. */
+	CHKiRet(mmk_build_token_header(pWrkrData));
 finalize_it:
-	free(token);
 	free(statsName);
-	if ((iRet != RS_RET_OK) && pWrkrData->stats) {
-		statsobj.Destruct(&(pWrkrData->stats));
-	}
-	if (fp) {
-		fclose(fp);
+	if (iRet != RS_RET_OK) {
+		/* rsyslog does not call freeWrkrInstance when createWrkrInstance fails,
+		 * so release the curl handle here to avoid leaking it (e.g. if the
+		 * initial token-header build fails). */
+		if (pWrkrData->curlCtx != NULL) {
+			curl_easy_cleanup(pWrkrData->curlCtx);
+			pWrkrData->curlCtx = NULL;
+		}
+		if (pWrkrData->curlHdr != NULL) {
+			curl_slist_free_all(pWrkrData->curlHdr);
+			pWrkrData->curlHdr = NULL;
+		}
+		if (pWrkrData->stats) {
+			statsobj.Destruct(&(pWrkrData->stats));
+		}
 	}
 ENDcreateWrkrInstance
 
@@ -1283,6 +1369,7 @@ CODESTARTnewActInst
 	pData->sslPartialChain = loadModConf->sslPartialChain;
 	pData->cacheEntryTTL = loadModConf->cacheEntryTTL;
 	pData->cacheExpireInterval = loadModConf->cacheExpireInterval;
+	pData->tokenReloadInterval = loadModConf->tokenReloadInterval;
 	for(i = 0 ; i < actpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed) {
 			continue;
@@ -1426,6 +1513,8 @@ CODESTARTnewActInst
 			pData->cacheEntryTTL = pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "cacheexpireinterval")) {
 			pData->cacheExpireInterval = pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "tokenreloadinterval")) {
+			pData->tokenReloadInterval = pvals[i].val.d.n;
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in action() block\n", actpblk.descr[i].name);
@@ -1458,6 +1547,14 @@ CODESTARTnewActInst
 					pData->cacheEntryTTL);
 			ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 		}
+	}
+
+	if (pData->tokenReloadInterval < 0) {
+		LogError(0, RS_RET_CONFIG_ERROR,
+				"mmkubernetes: tokenreloadinterval value [%d] is invalid - "
+				"value must be 0 (disabled) or greater",
+				pData->tokenReloadInterval);
+		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 	}
 
 	if(pData->kubernetesUrl == NULL) {
@@ -1605,6 +1702,7 @@ CODESTARTdbgPrintInstInfo
 	dbgprintf("\tbusyretryinterval='%d'\n", pData->busyRetryInterval);
 	dbgprintf("\tcacheentryttl='%d'\n", pData->cacheEntryTTL);
 	dbgprintf("\tcacheexpireinterval='%d'\n", pData->cacheExpireInterval);
+	dbgprintf("\ttokenreloadinterval='%d'\n", pData->tokenReloadInterval);
 ENDdbgPrintInstInfo
 
 
@@ -1717,6 +1815,26 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, time_t now, struct json_object
 	struct json_tokener *jt = NULL;
 	struct json_object *jo;
 	long resp_code = 400;
+	int reloaded_token = 0;
+
+	/* Proactive token refresh: the bearer token is cached in the curl header at
+	 * worker start and otherwise never re-read. A projected ServiceAccount token
+	 * may be short-lived (kubelet rotates the on-disk file well before expiry),
+	 * so re-read it every tokenReloadInterval seconds to stay inside the validity
+	 * window and avoid the 401 entirely. A single missed reload is harmless
+	 * because validity greatly exceeds the interval. The reactive reload-on-401
+	 * below remains as a backstop for the startup / identity-warm-up window this
+	 * cannot cover. Done before the busy-time adjustment below, which mutates
+	 * `now`. tokenReloadInterval == 0 disables the proactive reload. */
+	if (pWrkrData->pData->tokenReloadInterval > 0 &&
+	    now - pWrkrData->lastTokenReload >= pWrkrData->pData->tokenReloadInterval) {
+		if (mmk_build_token_header(pWrkrData) != RS_RET_OK) {
+			/* keep the existing (still likely-valid) header; retry next call */
+			LogMsg(0, RS_RET_OK, LOG_INFO,
+				"mmkubernetes: proactive token reload failed; keeping cached "
+				"token and will retry on the next lookup\n");
+		}
+	}
 
 	if (pWrkrData->pData->cache->lastBusyTime) {
 		now -= pWrkrData->pData->cache->lastBusyTime;
@@ -1739,6 +1857,7 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, time_t now, struct json_object
 	ccode = curl_easy_setopt(pWrkrData->curlCtx, CURLOPT_URL, url);
 	if(ccode != CURLE_OK)
 		ABORT_FINALIZE(RS_RET_ERR);
+retry_query:
 	if(CURLE_OK != (ccode = curl_easy_perform(pWrkrData->curlCtx))) {
 		LogMsg(0, RS_RET_ERR, LOG_ERR,
 			      "mmkubernetes: failed to connect to [%s] - %d:%s\n",
@@ -1751,6 +1870,29 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, time_t now, struct json_object
 			      "mmkubernetes: could not get response code from query to [%s] - %d:%s\n",
 			      url, ccode, curl_easy_strerror(ccode));
 		ABORT_FINALIZE(RS_RET_ERR);
+	}
+	/* On a 401 the most likely cause is a stale bearer token: the projected SA
+	 * token rotated on disk, or this worker came up before its node identity was
+	 * authorized. The header is built once at worker construction and otherwise
+	 * only refreshed by the proactive interval above. Re-read the token from
+	 * disk, rebuild the header, and retry the request exactly once before
+	 * surfacing the error. The response body buffered from the failed attempt is
+	 * drained first so the retry parses cleanly. A 403 (Forbidden) is not
+	 * retried: it means the request authenticated but this identity lacks access,
+	 * so re-reading the same token cannot help. */
+	if(resp_code == 401 && !reloaded_token) {
+		reloaded_token = 1;
+		if(pWrkrData->curlRply != NULL) {
+			free(pWrkrData->curlRply);
+			pWrkrData->curlRply = NULL;
+			pWrkrData->curlRplyLen = 0;
+		}
+		if(mmk_build_token_header(pWrkrData) == RS_RET_OK) {
+			LogMsg(0, RS_RET_OK, LOG_INFO,
+				      "mmkubernetes: got [%ld] for url [%s] - reloaded SA token "
+				      "and retrying once\n", resp_code, url);
+			goto retry_query;
+		}
 	}
 	if(resp_code == 401) {
 		LogMsg(0, RS_RET_ERR, LOG_ERR,

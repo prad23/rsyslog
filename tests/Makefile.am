@@ -1855,11 +1855,13 @@ if ENABLE_IMFILE
 if ENABLE_IMPSTATS
 TESTS += \
 	mmkubernetes-basic.sh \
-	mmkubernetes-cache-expire.sh
+	mmkubernetes-cache-expire.sh \
+	mmkubernetes-token-reload.sh
 if HAVE_VALGRIND
 TESTS += \
 	mmkubernetes-basic-vg.sh \
-	mmkubernetes-cache-expire-vg.sh
+	mmkubernetes-cache-expire-vg.sh \
+	mmkubernetes-token-reload-vg.sh
 endif
 endif
 endif
@@ -3174,6 +3176,8 @@ EXTRA_DIST= \
 	mmkubernetes-cache-expire.sh \
 	mmkubernetes-cache-expire-vg.sh \
 	mmkubernetes-cache-expire.out.expected \
+	mmkubernetes-token-reload.sh \
+	mmkubernetes-token-reload-vg.sh \
 	mmkubernetes.supp \
 	es-writeoperation.sh \
 	imdocker-basic.sh \
